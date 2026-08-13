@@ -1,0 +1,20 @@
+[project]
+name = "timesheet-mcp"
+version = "0.1.0"
+description = "Servidor MCP para mantener el control horario del profesional y exportar a .xlsx con la plantilla PRIS"
+requires-python = ">=3.11"
+dependencies = [
+  "openpyxl>=3.1",
+  "mcp[cli]>=1.0,<2",
+  "pydantic>=2.6",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["timesheet*"]
+
+[project.scripts]
+timesheet-mcp = "server:main"

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+data/state.json
+data/state.json.tmp
+exports/*.xlsx
+*.log
+/Timesheet Modelo Mayo 2025 PRIS.xlsx
