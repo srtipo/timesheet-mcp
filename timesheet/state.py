@@ -1,4 +1,10 @@
-"""Persistencia y mutadores del estado del timesheet."""
+"""Persistencia y mutadores del estado del timesheet.
+
+A partir de v0.3 el estado NO tiene un mes activo. Cada entrada vive por su
+fecha ISO en `state.days`; los meses se calculan a partir de esas fechas.
+Como consecuencia, registrar o borrar entradas nunca puede borrar data de
+otro mes: no existe la operacion "cambiar de mes".
+"""
 
 from __future__ import annotations
 
@@ -10,7 +16,7 @@ from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any, Optional
 
-from .dates import is_working_day, working_days
+from .dates import DEFAULT_ENTRY, _compute_exit
 from .models import Day, DayItem, Professional, State, Supervisor
 
 
@@ -38,17 +44,12 @@ def _ensure_dirs() -> None:
 def default_state() -> State:
     return State(
         schema_version=1,
-        year=2026,
-        month=6,
         professional=Professional(
             name="Victor Acosta",
             specialty="Desarrollador Front-End",
             hourly_rate=3.5,
         ),
-        supervisor=Supervisor(
-            name="Raúl D. Olivero Carrucini",
-            **{"date": date(2026, 6, 30)},
-        ),
+        supervisor=Supervisor(name="Raúl D. Olivero Carrucini"),
         days={},
     )
 
@@ -64,11 +65,28 @@ def _migrate_assign_ids(state: State) -> bool:
     return changed
 
 
+def _migrate_drop_legacy_fields(payload: dict) -> tuple[dict, bool]:
+    """Quita campos legacy (year, month) si aparecen en el JSON guardado.
+
+    Esto permite cargar archivos state.json de v0.2 sin error.
+    Los dias se conservan porque viven en su propia fecha.
+
+    Devuelve (payload, changed). Si changed=True el archivo debe reescribirse.
+    """
+    changed = False
+    for k in ("year", "month"):
+        if k in payload:
+            del payload[k]
+            changed = True
+    return payload, changed
+
+
 def load_state() -> State:
     """Carga el estado desde data/state.json; crea defaults si no existe.
 
-    Aplica migracion on-load: si algun item carece de id, se le asigna un
-    UUID4 y el archivo se reescribe atomicamente.
+    Aplica migraciones on-load:
+    - Si hay campos legacy `year`/`month` se descartan silenciosamente.
+    - Si algun item carece de id, se le asigna UUID4 y se reescribe atomicamente.
     """
     _ensure_dirs()
     if not STATE_FILE.exists():
@@ -77,8 +95,12 @@ def load_state() -> State:
         return st
     raw = STATE_FILE.read_text(encoding="utf-8")
     data: dict[str, Any] = json.loads(raw)
+    data, legacy_dropped = _migrate_drop_legacy_fields(data)
     state = State.model_validate(data)
+    dirty = legacy_dropped
     if _migrate_assign_ids(state):
+        dirty = True
+    if dirty:
         save_state(state)
     return state
 
@@ -98,6 +120,21 @@ def save_state(state: State) -> None:
 # ---------------------------------------------------------------------------
 # Validadores / helpers puros
 # ---------------------------------------------------------------------------
+
+def _ensure_day_defaults(day: Day) -> None:
+    """Aplica defaults in-place: entry=08:00 si None, exit=entry+sum(hours).
+
+    Entry: solo se setea si es None (override explicito del usuario preservado).
+    Exit: se recalcula como entry+sum(hours) en cada llamada, salvo que
+    exit_locked=True (caso en que el usuario fijo la salida via set_day_metadata
+    y futuras mutaciones de items no la deben tocar).
+    """
+    if day.entry is None:
+        day.entry = DEFAULT_ENTRY
+    if not day.exit_locked:
+        total = sum(it.hours for it in day.items)
+        day.exit = _compute_exit(day.entry, total)
+
 
 _HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
@@ -125,33 +162,19 @@ def parse_hhmm(value: Any) -> Optional[time]:
     return datetime.strptime(s, "%H:%M").time()
 
 
-def assert_working_day_in_active_month(d: date, year: int, month: int) -> None:
-    if d.year != year or d.month != month:
-        raise ValidationError(
-            f"fecha {d.isoformat()} fuera del mes activo {year:04d}-{month:02d}"
-        )
-    if not is_working_day(d):
-        raise ValidationError(
-            f"fecha {d.isoformat()} no es laborable (Lun-Vie)"
-        )
+def assert_iso_date(s: str) -> date:
+    """Valida que `s` sea una fecha ISO valida (YYYY-MM-DD).
 
-
-def assert_working_day_str(s: str, year: int, month: int) -> date:
+    No valida contra ningun mes activo: el estado es multi-mes.
+    """
+    if not isinstance(s, str):
+        raise ValidationError("date debe ser string 'YYYY-MM-DD'")
     try:
-        d = date.fromisoformat(s)
+        return date.fromisoformat(s)
     except ValueError as exc:
         raise ValidationError(
             f"fecha invalida {s!r}; formato esperado YYYY-MM-DD"
         ) from exc
-    assert_working_day_in_active_month(d, year, month)
-    return d
-
-
-def assert_year_month(year: int, month: int) -> None:
-    if not (2000 <= year <= 2100):
-        raise ValidationError(f"year fuera de rango [2000, 2100]: {year}")
-    if not (1 <= month <= 12):
-        raise ValidationError(f"month fuera de rango [1, 12]: {month}")
 
 
 def assert_stripped_nonempty(value: Any, field: str) -> str:
@@ -172,6 +195,13 @@ def assert_positive_number(value: Any, field: str, *, ge: float = 0) -> float:
     return round(f, 2)
 
 
+def assert_year_month(year: int, month: int) -> None:
+    if not (2000 <= year <= 2100):
+        raise ValidationError(f"year fuera de rango [2000, 2100]: {year}")
+    if not (1 <= month <= 12):
+        raise ValidationError(f"month fuera de rango [1, 12]: {month}")
+
+
 def ensure_day(state: State, iso_date: str) -> Day:
     day = state.days.get(iso_date)
     if day is None:
@@ -190,30 +220,7 @@ def apply_set_professional_info(
     name: Any = _UNSET,
     specialty: Any = _UNSET,
     hourly_rate: Any = _UNSET,
-    year: Any = _UNSET,
-    month: Any = _UNSET,
 ) -> dict:
-    discarded: list[str] = []
-    new_year = state.year
-    new_month = state.month
-
-    if year is not _UNSET:
-        if not isinstance(year, int) or isinstance(year, bool):
-            raise ValidationError("year debe ser entero")
-        new_year = year
-    if month is not _UNSET:
-        if not isinstance(month, int) or isinstance(month, bool):
-            raise ValidationError("month debe ser entero")
-        new_month = month
-
-    assert_year_month(new_year, new_month)
-
-    if (new_year, new_month) != (state.year, state.month):
-        discarded = sorted(state.days.keys())
-        state.days = {}
-        state.year = new_year
-        state.month = new_month
-
     if name is not _UNSET:
         state.professional.name = assert_stripped_nonempty(name, "name")
     if specialty is not _UNSET:
@@ -221,8 +228,7 @@ def apply_set_professional_info(
     if hourly_rate is not _UNSET:
         rate = assert_positive_number(hourly_rate, "hourly_rate", ge=0)
         state.professional.hourly_rate = rate
-
-    return {"discarded_days": discarded}
+    return {}
 
 
 def apply_set_supervisor(
@@ -257,12 +263,13 @@ def apply_set_day_metadata(
     entry: Any = _UNSET,
     exit_: Any = _UNSET,
 ) -> dict:
-    assert_working_day_str(iso_date, state.year, state.month)
+    assert_iso_date(iso_date)
     day = ensure_day(state, iso_date)
     if entry is not _UNSET:
         day.entry = parse_hhmm(entry)
     if exit_ is not _UNSET:
         day.exit = parse_hhmm(exit_)
+        day.exit_locked = True
     return {
         "date": iso_date,
         "entry": day.entry.strftime("%H:%M") if day.entry else None,
@@ -277,7 +284,7 @@ def apply_set_day_item(
     description: str,
     hours: Any = _UNSET,
 ) -> dict:
-    assert_working_day_str(iso_date, state.year, state.month)
+    assert_iso_date(iso_date)
     desc = assert_stripped_nonempty(description, "description")
     day = ensure_day(state, iso_date)
 
@@ -287,6 +294,7 @@ def apply_set_day_item(
 
     if existing_idx is not None and hours is _UNSET:
         existing = day.items[existing_idx]
+        _ensure_day_defaults(day)
         return {
             "warning": "horas omitidas, item existente preservado",
             "item": existing.model_dump(),
@@ -298,6 +306,7 @@ def apply_set_day_item(
         h = assert_positive_number(hours, "hours", ge=0)
         existing = day.items[existing_idx]
         existing.hours = h
+        _ensure_day_defaults(day)
         return {
             "item": existing.model_dump(),
             "date": iso_date,
@@ -312,6 +321,7 @@ def apply_set_day_item(
         h = assert_positive_number(hours, "hours", ge=0)
         new_item = DayItem(description=desc, hours=h)
     day.items.append(new_item)
+    _ensure_day_defaults(day)
     return {
         "item": new_item.model_dump(),
         "date": iso_date,
@@ -325,7 +335,7 @@ def apply_set_day_items(
     iso_date: str,
     items: list,
 ) -> dict:
-    assert_working_day_str(iso_date, state.year, state.month)
+    assert_iso_date(iso_date)
     day = ensure_day(state, iso_date)
 
     new_items: list[DayItem] = []
@@ -347,6 +357,7 @@ def apply_set_day_items(
     day.items = new_items
     day.entry = entry
     day.exit = exit_
+    _ensure_day_defaults(day)
 
     return {
         "date": iso_date,
@@ -356,7 +367,7 @@ def apply_set_day_items(
 
 
 def apply_delete_day_item(state: State, *, iso_date: str, description: str) -> dict:
-    assert_working_day_str(iso_date, state.year, state.month)
+    assert_iso_date(iso_date)
     desc = assert_stripped_nonempty(description, "description")
     day = state.days.get(iso_date)
     if day is None:
@@ -382,7 +393,7 @@ def apply_delete_day_item(state: State, *, iso_date: str, description: str) -> d
 
 
 def apply_delete_day(state: State, *, iso_date: str) -> dict:
-    assert_working_day_str(iso_date, state.year, state.month)
+    assert_iso_date(iso_date)
     existed = state.days.pop(iso_date, None)
     if existed is None:
         return {"warning": "dia inexistente", "date": iso_date}
@@ -396,8 +407,8 @@ def apply_move_item(
     to_date: str,
     item_id: str,
 ) -> dict:
-    assert_working_day_str(from_date, state.year, state.month)
-    assert_working_day_str(to_date, state.year, state.month)
+    assert_iso_date(from_date)
+    assert_iso_date(to_date)
     if not isinstance(item_id, str) or not item_id.strip():
         raise ValidationError("item_id debe ser string no vacio")
     src = state.days.get(from_date)
@@ -435,17 +446,19 @@ __all__ = [
     "TEMPLATE_FILE",
     "EXPORTS_DIR",
     "ValidationError",
+    "DEFAULT_ENTRY",
     "default_state",
     "load_state",
     "save_state",
     "normalize_hhmm",
     "parse_hhmm",
-    "assert_working_day_in_active_month",
-    "assert_working_day_str",
+    "assert_iso_date",
     "assert_year_month",
     "assert_stripped_nonempty",
     "assert_positive_number",
     "ensure_day",
+    "_compute_exit",
+    "_ensure_day_defaults",
     "apply_set_professional_info",
     "apply_set_supervisor",
     "apply_set_day_metadata",
@@ -454,5 +467,4 @@ __all__ = [
     "apply_delete_day_item",
     "apply_delete_day",
     "apply_move_item",
-    "working_days",
 ]

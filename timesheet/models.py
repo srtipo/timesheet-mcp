@@ -69,6 +69,7 @@ class DayItem(_Base):
 class Day(_Base):
     entry: time | None = None
     exit: time | None = None
+    exit_locked: bool = False
     items: list[DayItem] = Field(default_factory=list)
 
     @field_validator("items", mode="before")
@@ -81,8 +82,6 @@ class Day(_Base):
 
 class State(_Base):
     schema_version: int = 1
-    year: int = Field(..., ge=2000, le=2100)
-    month: int = Field(..., ge=1, le=12)
     professional: Professional
     supervisor: Supervisor
     days: dict[str, Day] = Field(default_factory=dict)

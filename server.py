@@ -1,10 +1,18 @@
-"""Servidor MCP stdio con los 11 tools del timesheet."""
+"""Servidor MCP stdio con los 12 tools del timesheet.
+
+A partir de v0.3 el estado es multi-mes (no hay "mes activo" persistente).
+Cada tool opera contra fechas ISO arbitrarias; el mes por defecto de las
+operaciones que lo requieren (get_timesheet, calculate_hours, export_to_excel)
+se resuelve en el momento de la llamada segun los parametros o, en su defecto,
+el mes actual del sistema.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
@@ -13,6 +21,12 @@ from mcp.server.stdio import stdio_server
 from mcp.types import ImageContent, TextContent, Tool
 
 import timesheet.state as state_mod
+from timesheet.dates import (
+    month_of,
+    months_present,
+    per_day_totals,
+    today_month,
+)
 from timesheet.renderer import render as do_render
 from timesheet.state import ValidationError, load_state, save_state
 
@@ -44,18 +58,46 @@ def _handle(name: str, args: dict) -> list[TextContent]:
         return _err(f"tool desconocido: {exc}")
 
 
+def _resolve_year_month(args: dict, key_year: str = "year", key_month: str = "month") -> tuple[int, int, str]:
+    """Devuelve (year, month, source). Source es 'explicit' o 'today'.
+
+    Si year o month faltan (None), cae al mes actual del sistema.
+    Si solo uno de los dos viene explicito, se exige el otro (ValidationError).
+    """
+    y_arg = args.get(key_year)
+    m_arg = args.get(key_month)
+    if y_arg is None and m_arg is None:
+        y, m = today_month()
+        return y, m, "today"
+    if y_arg is None or m_arg is None:
+        raise ValidationError(
+            f"{key_year} y {key_month} deben proveerse juntos (o ninguno, "
+            "en cuyo caso se usa el mes actual del sistema)"
+        )
+    if not isinstance(y_arg, int) or isinstance(y_arg, bool):
+        raise ValidationError(f"{key_year} debe ser entero")
+    if not isinstance(m_arg, int) or isinstance(m_arg, bool):
+        raise ValidationError(f"{key_month} debe ser entero")
+    state_mod.assert_year_month(y_arg, m_arg)
+    return y_arg, m_arg, "explicit"
+
+
 # ---- 5.1 get_timesheet ----------------------------------------------------
 
 def _get_timesheet(args: dict) -> dict:
     s = load_state()
+    year, month, source = _resolve_year_month(args)
+    per_day = _per_day(s, year, month)
     return {
+        "active_month": {"year": year, "month": month, "source": source},
         "state": json.loads(
             json.dumps(s.model_dump(mode="json", by_alias=True), ensure_ascii=False)
         ),
         "computed": {
-            "per_day": _per_day(s),
-            "month_total_hours": _month_hours(s),
-            "month_total_amount": _month_amount(s),
+            "per_day": per_day,
+            "month_total_hours": _month_hours(s, year, month),
+            "month_total_amount": _month_amount(s, year, month),
+            "months_present": _months_present(s),
         },
     }
 
@@ -69,13 +111,9 @@ def _set_professional_info(args: dict) -> dict:
         name=args.get("name", state_mod._UNSET),
         specialty=args.get("specialty", state_mod._UNSET),
         hourly_rate=args.get("hourly_rate", state_mod._UNSET),
-        year=args.get("year", state_mod._UNSET),
-        month=args.get("month", state_mod._UNSET),
     )
     save_state(s)
     return {
-        "year": s.year,
-        "month": s.month,
         "professional": s.professional.model_dump(by_alias=True),
         **out,
     }
@@ -192,66 +230,100 @@ def _move_item(args: dict) -> dict:
 
 def _calculate_hours(args: dict) -> dict:
     s = load_state()
-    per_day = []
-    for d in state_mod.working_days(s.year, s.month):
-        iso = d.isoformat()
-        day = s.days.get(iso)
-        per_day.append({
-            "date": iso,
-            "items_total": round(sum(it.hours for it in (day.items if day else [])), 2),
-            "items_count": len(day.items) if day else 0,
-            "entry": day.entry.strftime("%H:%M") if day and day.entry else None,
-            "exit": day.exit.strftime("%H:%M") if day and day.exit else None,
-            "items": [
-                {"id": it.id, "description": it.description, "hours": it.hours}
-                for it in (day.items if day else [])
-            ],
-        })
+    year, month, source = _resolve_year_month(args)
+    per_day = _per_day(s, year, month)
     return {
-        "per_day": per_day,
-        "month_total_hours": _month_hours(s),
-        "month_total_amount": _month_amount(s),
+        "active_month": {"year": year, "month": month, "source": source},
+        "per_day": [
+            {**entry, "items": _items_for(s, entry["date"])}
+            for entry in per_day
+        ],
+        "month_total_hours": _month_hours(s, year, month),
+        "month_total_amount": _month_amount(s, year, month),
+        "months_present": _months_present(s),
     }
 
 
 # ---- 5.11 export_to_excel ------------------------------------------------
 
 def _export_to_excel(args: dict) -> dict:
-    path = args.get("path")
-    out = do_render(out_path=Path(path) if path else None)
+    year, month, source = _resolve_year_month(args)
+    s = load_state()
+    from calendar import monthrange
+    _, days_in_month = monthrange(year, month)
+    prefix = f"{year:04d}-{month:02d}-"
+    has_data = any(
+        iso.startswith(prefix) and s.days[iso].items
+        for iso in s.days.keys()
+    )
+    if not has_data:
+        return {
+            "warning": f"no hay entradas con items para {year:04d}-{month:02d}",
+            "year": year,
+            "month": month,
+            "days_with_data": 0,
+            "days_in_month": days_in_month,
+            "path": None,
+            "isError": False,
+        }
+    out = do_render(
+        state=s,
+        year=year,
+        month=month,
+        out_path=Path(args["path"]) if args.get("path") else None,
+    )
+    out["active_month_source"] = source
     return out
+
+
+# ---- 5.12 list_months ----------------------------------------------------
+
+def _list_months(args: dict) -> dict:
+    s = load_state()
+    return {
+        "months_present": _months_present(s),
+        "today_month": {"year": today_month()[0], "month": today_month()[1]},
+        "isError": False,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Helpers locales (evitan import circular con renderer/dates)
 # ---------------------------------------------------------------------------
 
-def _per_day(s) -> list[dict]:
-    from timesheet.dates import working_days as wd_func
-    out = []
-    for d in wd_func(s.year, s.month):
-        iso = d.isoformat()
-        day = s.days.get(iso)
-        items = day.items if day else []
-        out.append({
-            "date": iso,
-            "items_total": round(sum(it.hours for it in items), 2),
-            "items_count": len(items),
-            "entry": day.entry.strftime("%H:%M") if day and day.entry else None,
-            "exit": day.exit.strftime("%H:%M") if day and day.exit else None,
-        })
-    return out
+def _per_day(s, year: int, month: int) -> list[dict]:
+    return per_day_totals(s, year, month)
 
 
-def _month_hours(s) -> float:
+def _month_hours(s, year: int, month: int) -> float:
     total = 0.0
-    for day in s.days.values():
-        total += sum(it.hours for it in day.items)
+    for entry in per_day_totals(s, year, month):
+        total += entry["items_total"]
     return round(total, 2)
 
 
-def _month_amount(s) -> float:
-    return round(_month_hours(s) * s.professional.hourly_rate, 2)
+def _month_amount(s, year: int, month: int) -> float:
+    return round(_month_hours(s, year, month) * s.professional.hourly_rate, 2)
+
+
+def _months_present(s) -> list[dict]:
+    out = []
+    for year, month in months_present(s):
+        count = sum(
+            1 for iso in s.days.keys() if month_of(iso) == (year, month)
+        )
+        out.append({"year": year, "month": month, "day_count": count})
+    return out
+
+
+def _items_for(s, iso: str) -> list[dict]:
+    day = s.days.get(iso)
+    if day is None:
+        return []
+    return [
+        {"id": it.id, "description": it.description, "hours": it.hours}
+        for it in day.items
+    ]
 
 
 HANDLERS: dict[str, Callable[[dict], dict]] = {
@@ -266,6 +338,7 @@ HANDLERS: dict[str, Callable[[dict], dict]] = {
     "move_item": _move_item,
     "calculate_hours": _calculate_hours,
     "export_to_excel": _export_to_excel,
+    "list_months": _list_months,
 }
 
 
@@ -313,24 +386,29 @@ TOOLS: list[Tool] = [
     Tool(
         name="get_timesheet",
         description=(
-            "Devuelve el estado completo del timesheet (professional, supervisor, days) "
-            "mas un bloque computed con totales por dia y mes."
+            "Devuelve el estado completo del timesheet (professional, supervisor, "
+            "todos los dias de todos los meses) mas un bloque computed con el "
+            "mes activo (filtrado). Sin year/month usa el mes actual del sistema."
         ),
-        inputSchema=_schema({}, []),
+        inputSchema=_schema(
+            {
+                "year": _integer("Filtra al anio indicado (2000-2100). Opcional.", minimum=2000, maximum=2100),
+                "month": _integer("Filtra al mes indicado (1-12). Opcional.", minimum=1, maximum=12),
+            },
+            [],
+        ),
     ),
     Tool(
         name="set_professional_info",
         description=(
-            "Edita nombre, especialidad, tarifa, anio o mes del profesional. "
-            "Si cambia year o month, descarta TODOS los dias del mes anterior "
-            "y los lista en discarded_days."
+            "Edita nombre, especialidad o tarifa del profesional. "
+            "Cambiar estos campos NUNCA borra entradas existentes: el estado "
+            "es multi-mes y cada entrada vive por su fecha ISO."
         ),
         inputSchema=_schema(
             {
                 "name": _string("Nombre completo del profesional"),
                 "specialty": _string("Especialidad / puesto"),
-                "year": _integer("Anio (2000-2100)", minimum=2000, maximum=2100),
-                "month": _integer("Mes (1-12)", minimum=1, maximum=12),
                 "hourly_rate": _number("Tarifa por hora (>= 0)", minimum=0),
             },
             [],
@@ -351,11 +429,12 @@ TOOLS: list[Tool] = [
         name="set_day_metadata",
         description=(
             "Edita la metadata de un dia (entry/exit en formato HH:MM). "
-            "El parametro no provisto conserva su valor actual. Pasar null lo limpia."
+            "El parametro no provisto conserva su valor actual. Pasar null lo limpia. "
+            "Acepta cualquier fecha ISO (multi-mes)."
         ),
         inputSchema=_schema(
             {
-                "date": _string("Fecha YYYY-MM-DD (laborable del mes activo)"),
+                "date": _string("Fecha YYYY-MM-DD"),
                 "entry": _null_or(_string("Hora de entrada HH:MM")),
                 "exit": _null_or(_string("Hora de salida HH:MM")),
             },
@@ -369,7 +448,7 @@ TOOLS: list[Tool] = [
             "actualiza las horas del primer match; si no, crea un item. "
             "Si hours se omite y la descripcion no existe, se calcula como "
             "max(0, 8 - sum(otros.hours)). Si hours se omite y la descripcion existe, "
-            "se preserva el item y se devuelve warning."
+            "se preserva el item y se devuelve warning. Acepta cualquier fecha ISO."
         ),
         inputSchema=_schema(
             {
@@ -384,7 +463,8 @@ TOOLS: list[Tool] = [
         name="set_day_items",
         description=(
             "Reemplaza la lista completa de items del dia. Conserva entry/exit. "
-            "items=[] deja la lista vacia pero conserva entry/exit."
+            "items=[] deja la lista vacia pero conserva entry/exit. "
+            "Acepta cualquier fecha ISO."
         ),
         inputSchema=_schema(
             {
@@ -410,7 +490,7 @@ TOOLS: list[Tool] = [
         name="delete_day_item",
         description=(
             "Borra el primer item cuya descripcion (strippeada) coincida en el dia. "
-            "Si no hay match, devuelve warning."
+            "Si no hay match, devuelve warning. Acepta cualquier fecha ISO."
         ),
         inputSchema=_schema(
             {
@@ -422,7 +502,10 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="delete_day",
-        description="Borra el dia completo (items + entry + exit). Si no existe, warning.",
+        description=(
+            "Borra el dia completo (items + entry + exit). Si no existe, warning. "
+            "Acepta cualquier fecha ISO."
+        ),
         inputSchema=_schema(
             {"date": _string("Fecha YYYY-MM-DD")},
             ["date"],
@@ -433,7 +516,7 @@ TOOLS: list[Tool] = [
         description=(
             "Mueve el item identificado por item_id desde from_date a to_date, "
             "preservando descripcion y horas. Conserva entry/exit de from_date aunque "
-            "la lista de items quede vacia. No valida colisiones en to_date."
+            "la lista de items quede vacia. Acepta cualquier par de fechas ISO."
         ),
         inputSchema=_schema(
             {
@@ -448,21 +531,42 @@ TOOLS: list[Tool] = [
         name="calculate_hours",
         description=(
             "Calcula totales por dia y por mes sin escribir nada. "
-            "Incluye los items con id por dia."
+            "Sin year/month usa el mes actual del sistema. "
+            "Devuelve months_present para saber que meses tienen datos."
         ),
-        inputSchema=_schema({}, []),
+        inputSchema=_schema(
+            {
+                "year": _integer("Filtra al anio indicado (2000-2100). Opcional.", minimum=2000, maximum=2100),
+                "month": _integer("Filtra al mes indicado (1-12). Opcional.", minimum=1, maximum=12),
+            },
+            [],
+        ),
     ),
     Tool(
         name="export_to_excel",
         description=(
-            "Renderiza el estado a un .xlsx respetando la plantilla PRIS. "
-            "Si no se pasa path, usa exports/timesheet-YYYY-MM.xlsx. "
-            "Si el mes tiene > 22 laborables, inserta filas y parchea formulas."
+            "Renderiza el mes indicado del estado a un .xlsx respetando la "
+            "plantilla PRIS. year y month son REQUERIDOS: si no se pasan, "
+            "se usa el mes actual del sistema. Si el mes no tiene entradas, "
+            "devuelve warning sin escribir archivo."
         ),
         inputSchema=_schema(
-            {"path": _string("Ruta absoluta o relativa del .xlsx de salida (opcional)")},
+            {
+                "year": _integer("Anio a exportar (2000-2100). Opcional: si falta junto con month, usa el mes actual.", minimum=2000, maximum=2100),
+                "month": _integer("Mes a exportar (1-12). Opcional: si falta junto con year, usa el mes actual.", minimum=1, maximum=12),
+                "path": _string("Ruta absoluta o relativa del .xlsx de salida (opcional)"),
+            },
             [],
         ),
+    ),
+    Tool(
+        name="list_months",
+        description=(
+            "Lista los meses (year, month) que tienen al menos una entrada "
+            "en state.days, ordenados cronologicamente. Tambien devuelve "
+            "el mes actual del sistema."
+        ),
+        inputSchema=_schema({}, []),
     ),
 ]
 
